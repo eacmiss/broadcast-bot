@@ -24,7 +24,7 @@ def save_data(data):
 
 # Проверка админа
 def is_admin(user_id):
-    admin_ids = os.getenv("ADMIN_USER_IDS", "").split(",")
+    admin_ids = [x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
     return str(user_id) in admin_ids
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +103,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📨 Отправить рассылку", callback_data="send_broadcast")],
-        [InlineKeyboardButton("⏰ Запланировать рассылку", callback_data="schedule_broadcast")],
         [InlineKeyboardButton("👥 Список пользователей", callback_data="user_list")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_main")]
@@ -177,6 +176,11 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("⛔ У вас нет прав администратора")
         return
     
+    if not update.message.text:
+        await update.message.reply_text("⚠️ Поддерживается только текстовое сообщение")
+        context.user_data['awaiting_broadcast'] = False
+        return
+
     message_text = update.message.text
     data = load_data()
     
@@ -192,8 +196,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=message_text,
-                parse_mode='HTML'
+                text=message_text
             )
             success_count += 1
         except Exception as e:

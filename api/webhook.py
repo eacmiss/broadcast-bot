@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 
 load_dotenv()
 
-DATA_FILE = "broadcast_data.json"
+DATA_FILE = "/tmp/broadcast_data.json" if os.getenv("VERCEL") else "broadcast_data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -21,7 +21,7 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def is_admin(user_id):
-    admin_ids = os.getenv("ADMIN_USER_IDS", "").split(",")
+    admin_ids = [x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
     return str(user_id) in admin_ids
 
 app = FastAPI()
@@ -116,7 +116,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📨 Отправить рассылку", callback_data="send_broadcast")],
-        [InlineKeyboardButton("⏰ Запланировать рассылку", callback_data="schedule_broadcast")],
         [InlineKeyboardButton("👥 Список пользователей", callback_data="user_list")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_main")]
@@ -189,6 +188,11 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("⛔ У вас нет прав администратора")
         return
     
+    if not update.message.text:
+        await update.message.reply_text("⚠️ Поддерживается только текстовое сообщение")
+        context.user_data['awaiting_broadcast'] = False
+        return
+
     message_text = update.message.text
     data = load_data()
     
@@ -204,8 +208,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=message_text,
-                parse_mode='HTML'
+                text=message_text
             )
             success_count += 1
         except Exception as e:
@@ -266,7 +269,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_main":
         await back_main(update, context)
 
+@app.post("/")
 @app.post("/webhook")
+@app.post("/api/webhook")
 async def webhook(request: Request):
     """Обработка Telegram webhook"""
     application = get_bot_app()
