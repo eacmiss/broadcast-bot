@@ -277,7 +277,11 @@ async def webhook(request: Request):
     application = get_bot_app()
     data = await request.json()
     update = Update.de_json(data, application.bot)
-    await application.process_update(update)
+    await application.initialize()
+    try:
+        await application.process_update(update)
+    finally:
+        await application.shutdown()
     return {"status": "ok"}
 
 @app.get("/")
