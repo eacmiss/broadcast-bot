@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 
@@ -14,16 +15,29 @@ load_dotenv()
 
 app = FastAPI()
 bot_app = None
+_init_lock = asyncio.Lock()
+_initialized = False
 
 
-def get_bot_app():
-    global bot_app
+async def get_bot_app():
+    """Лениво создаёт и инициализирует PTB Application один раз на инстанс.
+
+    ВАЖНО: shutdown() после каждого апдейта ломал бота — повторный
+    initialize() на «выключенном» приложении приводил к ошибкам,
+    и бот переставал отвечать до cold start.
+    """
+    global bot_app, _initialized
     if bot_app is None:
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN не найден")
         bot_app = Application.builder().token(token).build()
         register_handlers(bot_app)
+    if not _initialized:
+        async with _init_lock:
+            if not _initialized:
+                await bot_app.initialize()
+                _initialized = True
     return bot_app
 
 
@@ -32,16 +46,10 @@ def get_bot_app():
 @app.post("/api/webhook")
 async def webhook(request: Request):
     """Обработка вебхука Telegram"""
-    application = get_bot_app()
+    application = await get_bot_app()
     data = await request.json()
     update = Update.de_json(data, application.bot)
-
-    await application.initialize()
-    try:
-        await application.process_update(update)
-    finally:
-        await application.shutdown()
-
+    await application.process_update(update)
     return {"status": "ok"}
 
 

@@ -97,18 +97,23 @@ async def show_stats(update, context):
 # ---------- Выбор чатов ----------
 
 async def _get_dialog_cache(admin_id):
-    """Получить кэш диалогов (без entity — только key/title)"""
+    """Получить кэш диалогов (key/title/peer — без entity, он не сериализуется)"""
     data = load_data()
     cache = data.get("dlg_cache", {}).get(str(admin_id))
     if cache is None:
         try:
             dialogs = await tg_user.get_dialogs()
-            cache = [{"key": d["key"], "title": d["title"]} for d in dialogs]
+            cache = [{"key": d["key"], "title": d["title"], "peer": d["peer"]} for d in dialogs]
         except Exception as e:
             return None, str(e)
         data.setdefault("dlg_cache", {})[str(admin_id)] = cache
         save_data(data)
     return cache, None
+
+
+def _chat_title(v):
+    """Название чата из значения data['chats'] (dict или legacy-строка)."""
+    return v.get("title", "?") if isinstance(v, dict) else str(v)
 
 
 def _render_dialog_page(cache, chats, page):
@@ -190,11 +195,14 @@ async def toggle_chat(update, context):
     cache = data.get("dlg_cache", {}).get(admin_id, [])
     title = next((d["title"] for d in cache if d["key"] == key), key)
 
+    entry = next((d for d in cache if d["key"] == key), None)
+    peer = entry.get("peer") if entry else None
+
     if key in data['chats']:
         del data['chats'][key]
         await query.answer(f"❌ Убрано: {title[:30]}")
     else:
-        data['chats'][key] = title
+        data['chats'][key] = {"title": title, "peer": peer}
         await query.answer(f"✅ Добавлено: {title[:30]}")
 
     save_data(data)
@@ -214,8 +222,8 @@ async def my_chats(update, context):
         text = "📋 Выбранные чаты\n\nПока ничего не выбрано."
     else:
         text = f"� Выбранные чаты ({len(data['chats'])}):\n\n"
-        for i, (key, title) in enumerate(data['chats'].items(), 1):
-            text += f"{i}. {title}\n"
+        for i, (key, val) in enumerate(data['chats'].items(), 1):
+            text += f"{i}. {_chat_title(val)}\n"
 
     await query.edit_message_text(
         text,
@@ -260,10 +268,26 @@ async def broadcast_start(update, context):
 
 
 async def _resolve_selected():
-    """Вернуть entity-объекты выбранных чатов"""
+    """Список элементов выбранных чатов [{key,title,peer}] для резолва.
+
+    Peer-данные берём из кэша диалогов; если кэш протух — обновляем.
+    """
     data = load_data()
-    keys = list(data['chats'].keys())
-    return await tg_user.resolve_entities(keys)
+    admin_id = next(iter([k for k in data.get("dlg_cache", {})] or [None]), None)
+    cache = {}
+    if admin_id:
+        cache, _ = await _get_dialog_cache(admin_id)
+        cache = {d["key"]: d for d in (cache or [])}
+
+    items = []
+    for key, val in data['chats'].items():
+        title = _chat_title(val)
+        peer = val.get("peer") if isinstance(val, dict) else None
+        entry = cache.get(key)
+        if peer is None and entry:
+            peer = entry.get("peer")
+        items.append({"key": key, "title": title, "peer": peer})
+    return items
 
 
 async def _send_broadcast(update, context, kind, payload, caption=""):
@@ -276,8 +300,22 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
         f"📨 Начинаю рассылку в {total} чатов...\nЭто может занять время."
     )
 
-    entities = await _resolve_selected()
+    try:
+        items = await _resolve_selected()
+        entities, missing = await tg_user.resolve_entities(items)
+    except Exception as e:
+        context.user_data.pop('mode', None)
+        await update.message.reply_text(
+            f"❌ Не удалось подготовить рассылку:\n<code>{str(e)[:500]}</code>",
+            parse_mode="HTML")
+        return
     success, errors = 0, []
+    total_n = len(items)
+
+    # Чаты, которые не удалось резолвить — сразу в ошибки, чтобы не терялись молча
+    title_by_key = {it["key"]: it["title"] for it in items}
+    for key in missing:
+        errors.append(f"{title_by_key.get(key, key)}: чат недоступен (нет доступа или диалог удалён)")
 
     for i, entity in enumerate(entities):
         try:
@@ -288,7 +326,30 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
                 await tg_user.send_file(entity, payload, caption=caption)
             success += 1
         except Exception as e:
-            errors.append(f"{name}: {str(e)[:60]}")
+            # FloodWait: короткий — ждём и повторяем, длинный — пропускаем чат
+            if type(e).__name__ == 'FloodWaitError':
+                secs = getattr(e, 'seconds', 0)
+                if secs <= 60:
+                    await asyncio.sleep(secs + 1)
+                    try:
+                        if kind == 'text':
+                            await tg_user.send_text(entity, payload)
+                        else:
+                            await tg_user.send_file(entity, payload, caption=caption)
+                        success += 1
+                    except Exception as e2:
+                        errors.append(f"{name}: flood {secs}s")
+                else:
+                    errors.append(f"{name}: floodwait {secs}s")
+            else:
+                errors.append(f"{getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or entity.id}: {str(e)[:60]}")
+
+        # Прогресс каждые 10 чатов — чтобы было видно, что рассылка жива
+        if (i + 1) % 10 == 0 and i + 1 < total_n:
+            try:
+                await update.message.reply_text(f"📨 Прогресс: {i + 1}/{total_n} (успешно: {success})")
+            except Exception:
+                pass
 
         # Пауза между сообщениями (кроме последнего)
         delay = data.get('delay', 1)
