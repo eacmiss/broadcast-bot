@@ -302,7 +302,7 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
 
     try:
         items = await _resolve_selected()
-        entities, missing = await tg_user.resolve_entities(items)
+        targets, missing = await tg_user.resolve_entities(items)
     except Exception as e:
         context.user_data.pop('mode', None)
         await update.message.reply_text(
@@ -317,14 +317,16 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
     for key in missing:
         errors.append(f"{title_by_key.get(key, key)}: чат недоступен (нет доступа или диалог удалён)")
 
-    for i, entity in enumerate(entities):
+    for i, target in enumerate(targets):
+        peer, name = target["peer"], target["title"]
         try:
-            name = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or str(entity.id)
             if kind == 'text':
-                await tg_user.send_text(entity, payload)
+                await asyncio.wait_for(tg_user.send_text(peer, payload), timeout=30)
             else:
-                await tg_user.send_file(entity, payload, caption=caption)
+                await asyncio.wait_for(tg_user.send_file(peer, payload, caption=caption), timeout=30)
             success += 1
+        except asyncio.TimeoutError:
+            errors.append(f"{name}: таймаут отправки (30с)")
         except Exception as e:
             # FloodWait: короткий — ждём и повторяем, длинный — пропускаем чат
             if type(e).__name__ == 'FloodWaitError':
@@ -333,19 +335,19 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
                     await asyncio.sleep(secs + 1)
                     try:
                         if kind == 'text':
-                            await tg_user.send_text(entity, payload)
+                            await asyncio.wait_for(tg_user.send_text(peer, payload), timeout=30)
                         else:
-                            await tg_user.send_file(entity, payload, caption=caption)
+                            await asyncio.wait_for(tg_user.send_file(peer, payload, caption=caption), timeout=30)
                         success += 1
                     except Exception as e2:
                         errors.append(f"{name}: flood {secs}s")
                 else:
                     errors.append(f"{name}: floodwait {secs}s")
             else:
-                errors.append(f"{getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or entity.id}: {str(e)[:60]}")
+                errors.append(f"{name}: {str(e)[:60]}")
 
-        # Прогресс каждые 10 чатов — чтобы было видно, что рассылка жива
-        if (i + 1) % 10 == 0 and i + 1 < total_n:
+        # Прогресс каждые 5 чатов — чтобы было видно, что рассылка жива
+        if (i + 1) % 5 == 0 and i + 1 < total_n:
             try:
                 await update.message.reply_text(f"📨 Прогресс: {i + 1}/{total_n} (успешно: {success})")
             except Exception:
@@ -353,7 +355,7 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
 
         # Пауза между сообщениями (кроме последнего)
         delay = data.get('delay', 1)
-        if delay > 0 and i < len(entities) - 1:
+        if delay > 0 and i < len(targets) - 1:
             await asyncio.sleep(delay)
 
     data['sent_messages'] += success

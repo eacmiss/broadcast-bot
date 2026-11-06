@@ -71,23 +71,23 @@ async def get_dialogs():
 
 
 async def resolve_entities(items):
-    """Резолвит выбранные чаты.
+    """Резолвит выбранные чаты в InputPeer-объекты БЕЗ лишних запросов к API.
+
+    InputPeer достаточно для send_message/send_file — так мы не делаем
+    по одному get_entity на чат (это съедало таймаут serverless-функции
+    до первой отправки).
 
     items — список dict {key, title, peer} из кэша диалогов.
-    Возвращает (entities, missing_keys).
+    Возвращает (peers, missing_keys).
     """
-    client = await connect()
-    entities, missing = [], []
+    peers, missing = [], []
     for it in items:
         peer = peer_from_info(it["peer"]) if it.get("peer") else None
         if peer is not None:
-            try:
-                entities.append(await client.get_entity(peer))
-                continue
-            except Exception:
-                pass
-        missing.append(it["key"])
-    return entities, missing
+            peers.append({"peer": peer, "title": it.get("title") or it["key"], "key": it["key"]})
+        else:
+            missing.append(it["key"])
+    return peers, missing
 
 
 async def _send_with_retry(coro_factory, retries=2):
