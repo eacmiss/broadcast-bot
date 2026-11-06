@@ -11,6 +11,14 @@ import tg_user
 DATA_FILE = "/tmp/broadcast_data.json" if os.getenv("VERCEL") else "broadcast_data.json"
 PAGE_SIZE = 8
 
+# Управление бесконечной рассылкой (работает только в polling-режиме,
+# на Vercel serverless-функция будет убита по таймауту)
+_loop = {"active": False}
+
+
+def stop_loop():
+    _loop["active"] = False
+
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -46,7 +54,8 @@ START_TEXT = (
     "Как пользоваться:\n"
     "1. «Выбрать чаты» — отметь нужные диалоги\n"
     "2. «Создать рассылку» — отправь текст, фото или стикер\n"
-    "3. Бот разошлёт сообщение всем выбранным чатам\n\n"
+    "3. Бот разошлёт сообщение всем выбранным чатам по кругу\n"
+    "4. /stop — остановить рассылку\n\n"
     "Только для администратора."
 )
 
@@ -290,34 +299,24 @@ async def _resolve_selected():
     return items
 
 
-async def _send_broadcast(update, context, kind, payload, caption=""):
-    """Разослать контент по выбранным чатам через аккаунт"""
-    data = load_data()
-    total = len(data['chats'])
-    context.user_data.pop('mode', None)
+async def _interruptible_sleep(seconds):
+    """Sleep, прерываемый командой /stop (проверка каждые 2 сек)."""
+    end = asyncio.get_event_loop().time() + seconds
+    while _loop["active"] and asyncio.get_event_loop().time() < end:
+        await asyncio.sleep(min(2, max(0.1, end - asyncio.get_event_loop().time())))
 
-    await update.message.reply_text(
-        f"📨 Начинаю рассылку в {total} чатов...\nЭто может занять время."
-    )
 
-    try:
-        items = await _resolve_selected()
-        targets, missing = await tg_user.resolve_entities(items)
-    except Exception as e:
-        context.user_data.pop('mode', None)
-        await update.message.reply_text(
-            f"❌ Не удалось подготовить рассылку:\n<code>{str(e)[:500]}</code>",
-            parse_mode="HTML")
-        return
+async def _send_pass(update, targets, missing, title_by_key, kind, payload, caption, data):
+    """Один проход рассылки по всем чатам. Возвращает (success, errors)."""
     success, errors = 0, []
-    total_n = len(items)
+    total_n = len(targets) + len(missing)
 
-    # Чаты, которые не удалось резолвить — сразу в ошибки, чтобы не терялись молча
-    title_by_key = {it["key"]: it["title"] for it in items}
     for key in missing:
         errors.append(f"{title_by_key.get(key, key)}: чат недоступен (нет доступа или диалог удалён)")
 
     for i, target in enumerate(targets):
+        if not _loop["active"]:
+            break
         peer, name = target["peer"], target["title"]
         try:
             if kind == 'text':
@@ -356,18 +355,64 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
         # Пауза между сообщениями (кроме последнего)
         delay = data.get('delay', 1)
         if delay > 0 and i < len(targets) - 1:
-            await asyncio.sleep(delay)
+            await _interruptible_sleep(delay)
 
-    data['sent_messages'] += success
-    save_data(data)
+    return success, errors
 
-    result = f"✅ Рассылка завершена!\n\n📊 Результаты:\n• Успешно: {success}\n• Ошибок: {len(errors)}"
-    if errors:
-        result += "\n\n⚠️ Ошибки:\n" + "\n".join(errors[:5])
-        if len(errors) > 5:
-            result += f"\n... и ещё {len(errors) - 5}"
 
-    await update.message.reply_text(result, reply_markup=main_keyboard())
+async def _send_broadcast(update, context, kind, payload, caption=""):
+    """Рассылка по кругу: проход за проходом, пока не /stop.
+
+    ВНИМАНИЕ: бесконечный цикл работает только в polling-режиме
+    (python src/bot.py). На Vercel функцию убьёт таймаут.
+    """
+    data = load_data()
+    total = len(data['chats'])
+    context.user_data.pop('mode', None)
+
+    await update.message.reply_text(
+        f"📨 Начинаю рассылку в {total} чатов...\n"
+        "Работает в цикле до команды /stop.\nЭто может занять время."
+    )
+
+    try:
+        items = await _resolve_selected()
+        targets, missing = await tg_user.resolve_entities(items)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось подготовить рассылку:\n<code>{str(e)[:500]}</code>",
+            parse_mode="HTML")
+        return
+
+    title_by_key = {it["key"]: it["title"] for it in items}
+    _loop["active"] = True
+    cycle = 0
+    total_success, total_errors = 0, 0
+
+    while _loop["active"]:
+        cycle += 1
+        success, errors = await _send_pass(
+            update, targets, missing, title_by_key, kind, payload, caption, data)
+        total_success += success
+        total_errors += len(errors)
+        data['sent_messages'] += success
+        save_data(data)
+
+        if not _loop["active"]:
+            break
+
+        await update.message.reply_text(
+            f"🔁 Цикл {cycle} завершён: успешно {success}, ошибок {len(errors)}. "
+            f"Следующий цикл через {data.get('delay', 1)} сек. /stop — остановить.")
+        await _interruptible_sleep(data.get('delay', 1))
+
+    _loop["active"] = False
+    await update.message.reply_text(
+        f"⏹ Рассылка остановлена.\n"
+        f"Всего циклов: {cycle}\n"
+        f"Успешных отправок: {total_success}\n"
+        f"Ошибок: {total_errors}",
+        reply_markup=main_keyboard())
 
 
 async def set_delay_mode(update, context):
@@ -474,11 +519,24 @@ async def handle_callback(update, context):
         await toggle_chat(update, context)
 
 
+async def cmd_stop(update, context):
+    """Остановить циклическую рассылку"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет прав")
+        return
+    if _loop["active"]:
+        stop_loop()
+        await update.message.reply_text("⏹ Останавливаю рассылку...")
+    else:
+        await update.message.reply_text("Рассылка не запущена.")
+
+
 def register_handlers(application):
     """Регистрация обработчиков для polling и webhook"""
     from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", cmd_stop))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast))
     application.add_handler(MessageHandler(filters.PHOTO, handle_broadcast))
