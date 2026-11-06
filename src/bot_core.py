@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -15,7 +16,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return {"chats": {}, "sent_messages": 0, "dlg_cache": {}}
+    return {"chats": {}, "sent_messages": 0, "dlg_cache": {}, "delay": 1}
 
 
 def save_data(data):
@@ -34,6 +35,7 @@ def main_keyboard():
         [InlineKeyboardButton("� Выбранные чаты", callback_data="my_chats")],
         [InlineKeyboardButton("� Создать рассылку", callback_data="broadcast")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("⏱ Интервал", callback_data="set_delay")],
         [InlineKeyboardButton("ℹ️ Информация", callback_data="info")]
     ])
 
@@ -84,7 +86,8 @@ async def show_stats(update, context):
     await query.edit_message_text(
         f"📊 Статистика\n\n"
         f"💬 Выбрано чатов: {len(data['chats'])}\n"
-        f"📨 Отправлено сообщений: {data['sent_messages']}",
+        f"📨 Отправлено сообщений: {data['sent_messages']}\n"
+        f"⏱ Интервал между сообщениями: {data.get('delay', 1)} сек",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Назад", callback_data="back_main")]
         ])
@@ -276,7 +279,7 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
     entities = await _resolve_selected()
     success, errors = 0, []
 
-    for entity in entities:
+    for i, entity in enumerate(entities):
         try:
             name = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or str(entity.id)
             if kind == 'text':
@@ -286,6 +289,11 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
             success += 1
         except Exception as e:
             errors.append(f"{name}: {str(e)[:60]}")
+
+        # Пауза между сообщениями (кроме последнего)
+        delay = data.get('delay', 1)
+        if delay > 0 and i < len(entities) - 1:
+            await asyncio.sleep(delay)
 
     data['sent_messages'] += success
     save_data(data)
@@ -299,9 +307,50 @@ async def _send_broadcast(update, context, kind, payload, caption=""):
     await update.message.reply_text(result, reply_markup=main_keyboard())
 
 
+async def set_delay_mode(update, context):
+    query = update.callback_query
+    data = load_data()
+    context.user_data['mode'] = 'set_delay'
+    await query.edit_message_text(
+        f"⏱ Интервал между сообщениями\n\n"
+        f"Сейчас: {data.get('delay', 1)} сек\n\n"
+        "Отправь новое значение в секундах (0 — без паузы, например 3).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_main")]
+        ])
+    )
+
+
+async def handle_delay_input(update, context):
+    """Установка интервала"""
+    context.user_data.pop('mode', None)
+    text = update.message.text.strip()
+
+    try:
+        delay = int(text)
+        if delay < 0 or delay > 300:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введи число от 0 до 300 секунд")
+        return
+
+    data = load_data()
+    data['delay'] = delay
+    save_data(data)
+
+    await update.message.reply_text(
+        f"✅ Интервал установлен: {delay} сек между сообщениями",
+        reply_markup=main_keyboard()
+    )
+
+
 async def handle_broadcast(update, context):
     """Роутер контента рассылки (текст/фото/стикер)"""
-    if context.user_data.get('mode') != 'broadcast':
+    mode = context.user_data.get('mode')
+    if mode == 'set_delay':
+        await handle_delay_input(update, context)
+        return
+    if mode != 'broadcast':
         return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Нет прав")
@@ -349,6 +398,8 @@ async def handle_callback(update, context):
         await broadcast_start(update, context)
     elif data == "stats":
         await show_stats(update, context)
+    elif data == "set_delay":
+        await set_delay_mode(update, context)
     elif data == "info":
         await show_info(update, context)
     elif data == "back_main":
